@@ -47,6 +47,7 @@ if (!API_SECRET) {
 
 let browser = null;
 let context = null;
+let authHeader = null; // token the panel uses for its own API calls, if it uses one
 let loginPromise = null; // acts as a lock so concurrent requests don't log in twice
 
 async function getBrowser() {
@@ -92,6 +93,17 @@ async function login() {
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   });
   const page = await newContext.newPage();
+  let capturedAuth = null;
+
+  // The panel may keep its session in a token (Authorization header) instead
+  // of a cookie. Watch its own API calls and remember the header it uses.
+  page.on("request", (r) => {
+    try {
+      if (!r.url().includes("/api/")) return;
+      const h = r.headers();
+      if (h["authorization"]) capturedAuth = h["authorization"];
+    } catch (e) {}
+  });
 
   try {
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -171,8 +183,38 @@ async function login() {
     throw err;
   }
 
+  if (!capturedAuth) {
+    // Fallback: look for a token the page stored in the browser.
+    const tok = await page
+      .evaluate(() => {
+        const pairs = [];
+        for (const st of [window.localStorage, window.sessionStorage]) {
+          for (let i = 0; i < st.length; i++) pairs.push([st.key(i), st.getItem(st.key(i)) || ""]);
+        }
+        for (const [, v] of pairs) {
+          const m = v.match(/eyJ[\w-]+\.[\w-]+\.[\w-]+/);
+          if (m) return m[0];
+        }
+        for (const [k, v] of pairs) {
+          if (/token|auth|jwt/i.test(k) && v && v.length < 2000) {
+            try {
+              const j = JSON.parse(v);
+              if (typeof j === "string") return j;
+              if (j && (j.token || j.access_token)) return j.token || j.access_token;
+            } catch (e) {
+              return v;
+            }
+          }
+        }
+        return "";
+      })
+      .catch(() => "");
+    if (tok) capturedAuth = "Bearer " + tok;
+  }
+  authHeader = capturedAuth;
+
   await page.close().catch(() => {});
-  console.log("[login] Logged in successfully.");
+  console.log("[login] Logged in successfully." + (authHeader ? " (token found)" : " (cookie session)"));
 
   if (context) {
     await context.close().catch(() => {});
@@ -191,19 +233,30 @@ async function ensureLoggedIn() {
   return loginPromise;
 }
 
+function apiGet(ctx, cli) {
+  const headers = authHeader ? { authorization: authHeader } : {};
+  return ctx.request.get(`${BASE_URL}/api/cli-search?cli=${encodeURIComponent(cli)}`, { headers });
+}
+
 async function searchCli(cli) {
   let ctx = await ensureLoggedIn();
-  let res = await ctx.request.get(`${BASE_URL}/api/cli-search?cli=${encodeURIComponent(cli)}`);
+  let res = await apiGet(ctx, cli);
 
   if (res.status() === 401 || res.status() === 403) {
     // Session expired mid-flight - log in again once and retry.
     context = null;
     ctx = await ensureLoggedIn();
-    res = await ctx.request.get(`${BASE_URL}/api/cli-search?cli=${encodeURIComponent(cli)}`);
+    res = await apiGet(ctx, cli);
   }
 
   if (!res.ok()) {
-    throw new Error(`Lamix returned HTTP ${res.status()}`);
+    let body = "";
+    try {
+      body = (await res.text()).replace(/\s+/g, " ").slice(0, 120);
+    } catch (e) {}
+    throw new Error(
+      `Lamix returned HTTP ${res.status()} (auth: ${authHeader ? "token" : "cookie only"}) ${body}`
+    );
   }
   return res.json();
 }
