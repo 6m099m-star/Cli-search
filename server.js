@@ -59,8 +59,32 @@ async function getBrowser() {
   return browser;
 }
 
+// Short description of the current page, used in error messages so a failed
+// login can be diagnosed without opening the site by hand.
+async function describePage(page) {
+  try {
+    const info = await page.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll("input"))
+        .slice(0, 5)
+        .map((e) => [e.type || "text", e.name, e.id].filter(Boolean).join("/"));
+      const text = (document.body && document.body.innerText) || "";
+      return {
+        title: document.title,
+        inputs,
+        text: text.replace(/\s+/g, " ").trim().slice(0, 90),
+      };
+    });
+    const path = new URL(page.url()).pathname;
+    return `[page ${path} | title "${info.title.slice(0, 40)}" | inputs: ${
+      info.inputs.join(", ") || "none"
+    } | text: "${info.text}"]`;
+  } catch (e) {
+    return "[could not read page]";
+  }
+}
+
 async function login() {
-  console.log("[login] Logging into Lamix...");
+  console.log("[login] Logging in...");
   const b = await getBrowser();
   const newContext = await b.newContext({
     userAgent:
@@ -69,81 +93,85 @@ async function login() {
   });
   const page = await newContext.newPage();
 
-  await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+  try {
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-  // The exact field names on Lamix's login page weren't available while
-  // writing this, so several common patterns are tried in order. If login
-  // keeps failing, open the login page's HTML (view-source, or inspect in
-  // a browser) and adjust the selector lists below to match it.
-  const usernameSelectors = [
-    'input[name="username"]',
-    'input[name="email"]',
-    'input[type="email"]',
-    "input#username",
-    "input#email",
-    'input[placeholder*="sername" i]',
-    'input[placeholder*="mail" i]',
-  ];
-  const passwordSelectors = [
-    'input[name="password"]',
-    'input[type="password"]',
-    "input#password",
-  ];
-  const submitSelectors = [
-    'button[type="submit"]',
-    'button:has-text("Login")',
-    'button:has-text("Log in")',
-    'button:has-text("Sign in")',
-    'input[type="submit"]',
-  ];
-
-  async function firstMatch(selectors) {
-    for (const sel of selectors) {
-      const el = page.locator(sel).first();
-      if ((await el.count()) > 0) return el;
+    // The login form may be drawn by JavaScript after the page loads, so
+    // wait for the password box to actually appear before looking for fields.
+    const passField = page.locator('input[type="password"]:visible').first();
+    try {
+      await passField.waitFor({ state: "visible", timeout: 20000 });
+    } catch (e) {
+      throw new Error("Login form did not appear. " + (await describePage(page)));
     }
-    return null;
+
+    // Username box: try known names first, then fall back to the first
+    // visible text-like input on the page.
+    const userSelectors = [
+      'input[name="username"]',
+      'input[name="email"]',
+      'input[name="login"]',
+      'input[type="email"]',
+      "input#username",
+      "input#email",
+      'input[placeholder*="sername" i]',
+      'input[placeholder*="mail" i]',
+      'input[placeholder*="ogin" i]',
+      'input[type="text"]',
+      "input:not([type])",
+    ];
+    let userField = null;
+    for (const sel of userSelectors) {
+      const el = page.locator(`${sel}:visible`).first();
+      if ((await el.count()) > 0) {
+        userField = el;
+        break;
+      }
+    }
+    if (!userField) {
+      throw new Error("Username field not found. " + (await describePage(page)));
+    }
+
+    await userField.fill(USERNAME);
+    await passField.fill(PASSWORD);
+
+    const submitSelectors = [
+      'button[type="submit"]',
+      'button:has-text("Login")',
+      'button:has-text("Log in")',
+      'button:has-text("Sign in")',
+      'input[type="submit"]',
+      "button:visible",
+    ];
+    let submitted = false;
+    for (const sel of submitSelectors) {
+      const el = page.locator(`${sel}:visible`).first();
+      if ((await el.count()) > 0) {
+        await el.click();
+        submitted = true;
+        break;
+      }
+    }
+    if (!submitted) await passField.press("Enter");
+
+    // Success = the password box goes away (we left the login page).
+    await passField.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+
+    const stillThere = (await page.locator('input[type="password"]:visible').count()) > 0;
+    if (stillThere) {
+      throw new Error(
+        "Login did not succeed - still on the login page. Check LAMIX_USERNAME / LAMIX_PASSWORD. " +
+          (await describePage(page))
+      );
+    }
+  } catch (err) {
+    await page.close().catch(() => {});
+    await newContext.close().catch(() => {});
+    throw err;
   }
 
-  const userField = await firstMatch(usernameSelectors);
-  const passField = await firstMatch(passwordSelectors);
-
-  if (!userField || !passField) {
-    await page.close();
-    await newContext.close();
-    throw new Error(
-      "Could not find the username/password fields on the login page. " +
-        "Open the Lamix login page's HTML and update the selector lists in server.js."
-    );
-  }
-
-  await userField.fill(USERNAME);
-  await passField.fill(PASSWORD);
-
-  const submitButton = await firstMatch(submitSelectors);
-  if (submitButton) {
-    await Promise.all([
-      page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {}),
-      submitButton.click(),
-    ]);
-  } else {
-    await passField.press("Enter");
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-  }
-
-  // Confirm the login actually worked by calling a known authenticated
-  // endpoint (the one the panel itself calls after login).
-  const check = await newContext.request.get(`${BASE_URL}/api/auth/me`);
-  await page.close();
-
-  if (!check.ok()) {
-    await newContext.close();
-    throw new Error(
-      `Login did not succeed - the post-login check returned HTTP ${check.status()}. ` +
-        "Double-check LAMIX_USERNAME / LAMIX_PASSWORD, and that the selectors above match the real form."
-    );
-  }
-
+  await page.close().catch(() => {});
   console.log("[login] Logged in successfully.");
 
   if (context) {
