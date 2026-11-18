@@ -205,12 +205,30 @@ async function searchViaPage(ctx, cli) {
       throw new Error("SESSION_EXPIRED");
     }
 
+    // Give client-side rendered forms a moment to finish drawing.
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(400);
+
     let input = page.getByLabel(/sender/i).first();
     if ((await input.count()) === 0) {
-      input = page.locator('input[type="text"]:visible, input:not([type]):visible').first();
+      input = page
+        .locator(
+          'input[type="text"]:visible, input[type="search"]:visible, ' +
+            'input[type="email"]:visible, input[type="tel"]:visible, input:not([type]):visible'
+        )
+        .first();
     }
     if ((await input.count()) === 0) {
-      throw new Error("Could not find the sender search box on the CLI search page.");
+      // Last resort: any visible input at all (excluding obviously wrong kinds).
+      input = page
+        .locator(
+          'input:visible:not([type="password"]):not([type="checkbox"]):not([type="radio"])' +
+            ':not([type="hidden"]):not([type="submit"]):not([type="button"])'
+        )
+        .first();
+    }
+    if ((await input.count()) === 0) {
+      throw new Error("Could not find the sender search box. " + (await describePage(page)));
     }
     await input.fill(cli);
 
