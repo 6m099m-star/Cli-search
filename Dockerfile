@@ -9,7 +9,9 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY . .
 
-ENV PORT=3000
+ENV PORT=3000 \
+    NODE_ENV=production \
+    NODE_OPTIONS=--max-old-space-size=96
 EXPOSE 3000
 
 CMD ["node", "server.js"]
