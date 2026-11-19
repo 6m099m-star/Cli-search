@@ -45,18 +45,95 @@ if (!API_SECRET) {
   );
 }
 
+// ---- Cost-saving settings (all optional env vars) -------------------------
+// Railway bills RAM by the hour, and a headless Chromium needs a few hundred
+// MB. So the browser is only kept alive while it is being used and is closed
+// after BROWSER_IDLE_MS of silence. The login cookies are kept in memory, so
+// the next request re-opens the browser WITHOUT logging in again.
+const IDLE_MS = Number(process.env.BROWSER_IDLE_MS || 45000);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 30000); // 0 = off
+const MAX_CONCURRENT = Math.max(1, Number(process.env.MAX_CONCURRENT || 2));
+
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 let browser = null;
+let browserPromise = null;
 let context = null;
+let storageState = null; // saved cookies/localStorage from the last good login
 let loginPromise = null; // acts as a lock so concurrent requests don't log in twice
+let activeJobs = 0;
+let idleTimer = null;
 
 async function getBrowser() {
-  if (!browser) {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
+  if (browser) return browser;
+  if (!browserPromise) {
+    browserPromise = chromium
+      .launch({
+        headless: true,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--no-zygote",
+          "--disable-extensions",
+          "--disable-background-networking",
+          "--disable-sync",
+          "--mute-audio",
+          "--js-flags=--max-old-space-size=192",
+        ],
+      })
+      .then((b) => {
+        browser = b;
+        b.on("disconnected", () => {
+          if (browser === b) {
+            browser = null;
+            context = null;
+          }
+        });
+        return b;
+      })
+      .finally(() => {
+        browserPromise = null;
+      });
   }
-  return browser;
+  return browserPromise;
+}
+
+// New context that skips images/fonts/media: the results table is plain text,
+// so downloading these only wastes CPU, memory and bandwidth.
+async function makeContext(state) {
+  const b = await getBrowser();
+  const ctx = await b.newContext({
+    userAgent: USER_AGENT,
+    ...(state ? { storageState: state } : {}),
+  });
+  await ctx.route("**/*", (route) => {
+    const t = route.request().resourceType();
+    if (t === "image" || t === "font" || t === "media") return route.abort();
+    return route.continue();
+  });
+  return ctx;
+}
+
+async function closeBrowser() {
+  const c = context;
+  const b = browser;
+  context = null;
+  browser = null;
+  if (c) await c.close().catch(() => {});
+  if (b) await b.close().catch(() => {});
+  console.log("[browser] Closed (idle).");
+}
+
+function scheduleIdleClose() {
+  clearTimeout(idleTimer);
+  if (IDLE_MS <= 0) return;
+  idleTimer = setTimeout(() => {
+    if (activeJobs === 0 && (browser || context)) closeBrowser();
+  }, IDLE_MS);
 }
 
 // Short description of the current page, used in error messages so a failed
@@ -85,12 +162,7 @@ async function describePage(page) {
 
 async function login() {
   console.log("[login] Logging in...");
-  const b = await getBrowser();
-  const newContext = await b.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  });
+  const newContext = await makeContext(null);
   const page = await newContext.newPage();
   try {
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -173,6 +245,7 @@ async function login() {
   await page.close().catch(() => {});
   console.log("[login] Logged in successfully.");
 
+  storageState = await newContext.storageState().catch(() => null);
   if (context) {
     await context.close().catch(() => {});
   }
@@ -183,11 +256,25 @@ async function login() {
 async function ensureLoggedIn() {
   if (context) return context;
   if (!loginPromise) {
-    loginPromise = login().finally(() => {
+    loginPromise = (async () => {
+      // Re-open from saved cookies if we have them (cheap), else log in.
+      if (storageState) {
+        context = await makeContext(storageState);
+        return context;
+      }
+      return login();
+    })().finally(() => {
       loginPromise = null;
     });
   }
   return loginPromise;
+}
+
+async function dropSession() {
+  const c = context;
+  context = null;
+  storageState = null;
+  if (c) await c.close().catch(() => {});
 }
 
 const CLI_SEARCH_PATH = process.env.LAMIX_CLI_SEARCH_PATH || "/cli-search";
@@ -287,12 +374,53 @@ async function searchCli(cli) {
     return await searchViaPage(ctx, cli);
   } catch (err) {
     if (err && err.message === "SESSION_EXPIRED") {
-      context = null;
+      await dropSession();
       ctx = await ensureLoggedIn();
       return await searchViaPage(ctx, cli);
     }
     throw err;
   }
+}
+
+// Limit how many pages run at once (each one costs RAM), and queue the rest.
+const waiting = [];
+async function withSlot(fn) {
+  if (activeJobs >= MAX_CONCURRENT) {
+    await new Promise((resolve) => waiting.push(resolve));
+  } else {
+    activeJobs++;
+  }
+  clearTimeout(idleTimer);
+  try {
+    return await fn();
+  } finally {
+    const next = waiting.shift();
+    if (next) next(); // hand the slot straight to the next waiter
+    else activeJobs--;
+    if (activeJobs === 0) scheduleIdleClose();
+  }
+}
+
+// Same sender asked again within CACHE_TTL_MS -> answer from memory, and
+// identical simultaneous requests share one browser run.
+const cache = new Map(); // cli -> { t, data }
+const inflight = new Map(); // cli -> Promise
+
+async function cachedSearch(cli) {
+  const hit = cache.get(cli);
+  if (hit && Date.now() - hit.t < CACHE_TTL_MS) return hit.data;
+  if (inflight.has(cli)) return inflight.get(cli);
+  const p = withSlot(() => searchCli(cli))
+    .then((data) => {
+      if (CACHE_TTL_MS > 0) {
+        cache.set(cli, { t: Date.now(), data });
+        if (cache.size > 200) cache.delete(cache.keys().next().value);
+      }
+      return data;
+    })
+    .finally(() => inflight.delete(cli));
+  inflight.set(cli, p);
+  return p;
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -310,7 +438,7 @@ app.get("/cli-search", async (req, res) => {
   }
 
   try {
-    const data = await searchCli(cli);
+    const data = await cachedSearch(cli);
     res.json(data);
   } catch (err) {
     console.error("[cli-search]", err);
